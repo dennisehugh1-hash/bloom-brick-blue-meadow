@@ -1,5 +1,21 @@
-import { playDeny, playShift, playWin } from "./audio";
-import { levels, phaseIndex, type Level } from "./levels";
+import { playDeny, playShift, playWin } from "./audio.ts";
+import { levels } from "./levels.ts";
+import {
+  AXES,
+  GOAL_R,
+  MAX_SPEED,
+  attemptPortals,
+  copy5,
+  dist5,
+  driveDelta,
+  projectedDistance,
+  rankOf,
+  setOwnedAxis,
+  toggleShown,
+  tryDelta,
+  zeros,
+  type Vec5,
+} from "./space.ts";
 
 export type Mode = "menu" | "play" | "paused" | "win";
 
@@ -10,40 +26,40 @@ export type View = {
   kicker: string;
   brief: string;
   hud: string;
-  w: number;
-  v: number;
-  wCount: number;
-  vCount: number;
   time: number;
   note: string;
   dist: number;
-  phaseOk: boolean;
+  stacked: boolean;
   unlocked: number;
   best: number;
   total: number;
+  coords: number[];
+  owned: boolean[];
+  shown: boolean[];
+  order: number[];
+  rank: number;
+  extras: string[];
 };
 
 const STEP_TURN = 2.75;
-const MAX_SPEED = 4.8;
-const PLAYER_R = 0.28;
 
 export const sim = {
   mode: "menu" as Mode,
   levelIndex: 0,
-  x: 0,
-  z: 0,
+  pos: zeros(),
+  owned: [true, false, false, false, false],
+  order: [0] as number[],
   yaw: Math.PI,
   speed: 0,
-  w: 0,
-  v: 0,
   time: 0,
   flash: 0,
   shake: 0,
   note: "",
   noteLeft: 0,
+  latch: null as string | null,
   touchThrottle: 0,
   touchSteer: 0,
-  shiftCd: 0,
+  touchExtra: [0, 0, 0],
   unlocked: 0,
   best: 0,
   winSaved: false,
@@ -52,7 +68,6 @@ export const sim = {
 const held = new Set<string>();
 let keyOverride: Set<string> | null = null;
 let steerOverride: number | null = null;
-const shiftQueue: Array<{ axis: "w" | "v"; dir: number }> = [];
 
 const listeners = new Set<() => void>();
 let view: View = emptyView();
@@ -67,17 +82,19 @@ function emptyView(): View {
     kicker: level.kicker,
     brief: level.brief,
     hud: level.hud,
-    w: level.start.w,
-    v: level.start.v,
-    wCount: level.wCount,
-    vCount: level.vCount,
     time: 0,
     note: "",
     dist: 0,
-    phaseOk: false,
+    stacked: false,
     unlocked: 0,
     best: 0,
     total: levels.length,
+    coords: level.start.pos.slice(),
+    owned: level.start.owned.slice(),
+    shown: [true, false, false, false, false],
+    order: level.start.order.slice(),
+    rank: 1,
+    extras: [],
   };
 }
 
@@ -90,24 +107,34 @@ export function getView() {
   return view;
 }
 
+function shownMask(order: readonly number[]) {
+  const mask = [false, false, false, false, false];
+  for (const axis of order) mask[axis] = true;
+  return mask;
+}
+
 export function publish() {
   const level = levels[sim.levelIndex];
-  const dist = Math.hypot(sim.x - level.goal.x, sim.z - level.goal.z);
-  const phaseOk = sim.w === level.goal.w && sim.v === level.goal.v;
+  const dist = dist5(sim.pos, level.goal);
+  const shownDist = projectedDistance(sim.pos, level.goal, sim.order);
+  const stacked = shownDist < 0.85 && dist > 0.9;
   const key = [
     sim.mode,
     sim.levelIndex,
-    sim.w,
-    sim.v,
     Math.floor(sim.time * 5),
     sim.note,
     sim.unlocked,
-    Math.round(dist),
-    phaseOk ? 1 : 0,
+    Math.round(dist * 10),
+    stacked ? 1 : 0,
     sim.best.toFixed(2),
+    sim.order.join(""),
+    sim.owned.map((on) => (on ? 1 : 0)).join(""),
+    sim.pos.map((n) => n.toFixed(1)).join(","),
   ].join("|");
   if (key === viewKey) return;
   viewKey = key;
+  const extras: string[] = [];
+  for (let s = 2; s < sim.order.length; s++) extras.push(AXES[sim.order[s]]);
   view = {
     mode: sim.mode,
     level: sim.levelIndex,
@@ -115,24 +142,26 @@ export function publish() {
     kicker: level.kicker,
     brief: level.brief,
     hud: level.hud,
-    w: sim.w,
-    v: sim.v,
-    wCount: level.wCount,
-    vCount: level.vCount,
     time: sim.time,
     note: sim.note,
     dist,
-    phaseOk,
+    stacked,
     unlocked: sim.unlocked,
     best: sim.best,
     total: levels.length,
+    coords: sim.pos.slice(),
+    owned: sim.owned.slice(),
+    shown: shownMask(sim.order),
+    order: sim.order.slice(),
+    rank: rankOf(sim.owned),
+    extras,
   };
   for (const fn of listeners) fn();
 }
 
 type Save = { unlocked: number; best: Record<string, number> };
 
-const SAVE_KEY = "appearance-5d-v1";
+const SAVE_KEY = "appearance-5d-v2";
 
 function readSave(): Save {
   try {
@@ -150,7 +179,7 @@ function readSave(): Save {
 
 function writeSave(save: Save) {
   try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify({ version: 1, ...save }));
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ version: 2, ...save }));
   } catch {
     /* ignore quota / private mode */
   }
@@ -165,82 +194,106 @@ export function loadLevel(index: number) {
   const i = Math.max(0, Math.min(levels.length - 1, index));
   const level = levels[i];
   sim.levelIndex = i;
-  sim.x = level.start.x;
-  sim.z = level.start.z;
+  sim.pos = copy5(level.start.pos);
+  sim.owned = level.start.owned.slice();
+  sim.order = level.start.order.slice();
   sim.yaw = level.start.yaw;
   sim.speed = 0;
-  sim.w = level.start.w;
-  sim.v = level.start.v;
   sim.time = 0;
   sim.flash = 0;
   sim.shake = 0;
   sim.note = "";
   sim.noteLeft = 0;
-  sim.shiftCd = 0;
+  sim.latch = null;
+  sim.touchThrottle = 0;
+  sim.touchSteer = 0;
+  sim.touchExtra = [0, 0, 0];
   sim.winSaved = false;
   sim.best = readSave().best[level.id] ?? 0;
-  shiftQueue.length = 0;
 }
 
-function say(text: string) {
-  if (sim.note === text) return;
+function say(text: string, hold = 2.2) {
   sim.note = text;
-  if (text && text !== "出口在另一层才显形") sim.noteLeft = 1.7;
+  sim.noteLeft = text ? hold : 0;
   publish();
 }
 
-export function requestShift(axis: "w" | "v", dir: number) {
+export function toggleDisplay(axis: number) {
   if (sim.mode !== "play") return;
-  if (shiftQueue.length >= 2) return;
-  shiftQueue.push({ axis, dir });
-}
-
-function circleHits(x: number, z: number, level: Level, w: number, v: number) {
-  const b = level.bounds;
-  if (x < b.minX - 0.5 + PLAYER_R || x > b.maxX + 0.5 - PLAYER_R) return true;
-  if (z < b.minZ - 0.5 + PLAYER_R || z > b.maxZ + 0.5 - PLAYER_R) return true;
-  const list = level.lists[phaseIndex(level, w, v)];
-  const r2 = PLAYER_R * PLAYER_R;
-  for (let i = 0; i < list.length; i++) {
-    const wall = list[i];
-    const cx = clamp(x, wall.x - 0.5, wall.x + 0.5);
-    const cz = clamp(z, wall.z - 0.5, wall.z + 0.5);
-    const dx = x - cx;
-    const dz = z - cz;
-    if (dx * dx + dz * dz < r2) return true;
-  }
-  return false;
-}
-
-function applyShift(axis: "w" | "v", dir: number) {
-  const level = levels[sim.levelIndex];
-  const nw = axis === "w" ? sim.w + dir : sim.w;
-  const nv = axis === "v" ? sim.v + dir : sim.v;
-  if (nw < 0 || nv < 0 || nw >= level.wCount || nv >= level.vCount) {
-    sim.shake = 0.2;
-    sim.flash = 0.35;
-    playDeny();
-    say(axis === "w" ? "显形轴已到尽头" : "折叠轴已到尽头");
+  const result = toggleShown(sim.order, axis);
+  if (!result.ok) {
+    say(result.reason, 1.4);
     return;
   }
-  if (circleHits(sim.x, sim.z, level, nw, nv)) {
-    sim.shake = 0.28;
-    sim.flash = 0.45;
-    playDeny();
-    say("这一层被实体占据");
-    return;
-  }
-  sim.w = nw;
-  sim.v = nv;
-  sim.flash = 1;
-  sim.note = "";
-  playShift();
+  sim.order = result.order;
+  sim.flash = 0.45;
   publish();
+}
+
+export function toggleOwned(axis: number) {
+  if (sim.mode !== "play") return;
+  const level = levels[sim.levelIndex];
+  const on = !sim.owned[axis];
+  const result = setOwnedAxis(sim.owned, axis, on, sim.pos, level.solids, level.bounds);
+  if (!result.ok) {
+    sim.shake = 0.2;
+    playDeny();
+    say(result.reason, 1.6);
+    return;
+  }
+  sim.owned = result.owned;
+  sim.latch = null;
+  sim.flash = 0.55;
+  say(on ? `${AXES[axis]} 纳入探针` : `${AXES[axis]} 已释放`, 1.2);
+  resolvePortal();
+}
+
+export function setTouchExtra(index: number, value: number) {
+  if (index < 0 || index > 2) return;
+  sim.touchExtra[index] = value;
 }
 
 function pressed(code: string) {
-  const src = keyOverride ?? held;
-  return src.has(code);
+  return (keyOverride ?? held).has(code);
+}
+
+export function setTestKeys(codes: string[] | null) {
+  keyOverride = codes ? new Set(codes) : null;
+}
+
+function extraInput(): [number, number, number] {
+  const extra: [number, number, number] = [0, 0, 0];
+  if (pressed("KeyQ")) extra[0] += 1;
+  if (pressed("KeyE")) extra[0] -= 1;
+  if (pressed("KeyZ")) extra[1] += 1;
+  if (pressed("KeyC")) extra[1] -= 1;
+  if (pressed("KeyR")) extra[2] += 1;
+  if (pressed("KeyF")) extra[2] -= 1;
+  for (let i = 0; i < 3; i++) extra[i] = clamp(extra[i] + sim.touchExtra[i], -1, 1);
+  return extra;
+}
+
+function resolvePortal() {
+  const level = levels[sim.levelIndex];
+  const result = attemptPortals(sim.pos, sim.owned, level.portals, level.solids, level.bounds, sim.latch);
+  sim.pos = result.pos;
+  sim.latch = result.latch;
+  if (result.fired) {
+    sim.flash = 1;
+    sim.speed *= 0.35;
+    playShift();
+    say(result.note);
+  } else if (result.deny) {
+    sim.shake = 0.28;
+    sim.flash = 0.4;
+    playDeny();
+    say(result.note, 1.8);
+  }
+  if (sim.mode === "play" && dist5(sim.pos, level.goal) < GOAL_R) {
+    sim.mode = "win";
+    sim.speed = 0;
+    commitWin();
+  }
 }
 
 function commitWin() {
@@ -267,15 +320,12 @@ export function step(dt: number) {
   }
 
   sim.time += dt;
-  sim.shiftCd = Math.max(0, sim.shiftCd - dt);
-  if (sim.note && sim.note !== "出口在另一层才显形") {
+  if (sim.note) {
     sim.noteLeft -= dt;
-    if (sim.noteLeft <= 0) say("");
-  }
-  if (sim.shiftCd <= 0 && shiftQueue.length) {
-    const job = shiftQueue.shift();
-    if (job) applyShift(job.axis, job.dir);
-    sim.shiftCd = 0.18;
+    if (sim.noteLeft <= 0) {
+      sim.note = "";
+      sim.noteLeft = 0;
+    }
   }
 
   let throttle = 0;
@@ -297,53 +347,36 @@ export function step(dt: number) {
   const speedFactor = Math.max(0.7, Math.min(1, Math.abs(sim.speed) / 3));
   sim.yaw += steer * STEP_TURN * speedFactor * reverse * dt;
 
-  const fx = -Math.sin(sim.yaw);
-  const fz = -Math.cos(sim.yaw);
   const level = levels[sim.levelIndex];
-  const ox = sim.x;
-  const oz = sim.z;
-  let nx = sim.x + fx * sim.speed * dt;
-  if (circleHits(nx, sim.z, level, sim.w, sim.v)) nx = sim.x;
-  let nz = sim.z + fz * sim.speed * dt;
-  if (circleHits(nx, nz, level, sim.w, sim.v)) nz = sim.z;
-  sim.x = nx;
-  sim.z = nz;
-  if (Math.hypot(sim.x - ox, sim.z - oz) < Math.abs(sim.speed) * dt * 0.2) {
+  const delta = driveDelta(sim.order, sim.owned, sim.yaw, sim.speed, extraInput(), dt);
+  let moved = 0;
+  const origin = copy5(sim.pos);
+  tryDelta(sim.pos, sim.owned, delta, level.solids, level.bounds);
+  for (let i = 0; i < 5; i++) {
+    const d = sim.pos[i] - origin[i];
+    moved += d * d;
+  }
+  if (Math.sqrt(moved) < Math.abs(sim.speed) * dt * 0.2 && Math.abs(sim.speed) > 0.4) {
     sim.speed *= 0.45;
   }
 
-  const g = level.goal;
-  const dx = sim.x - g.x;
-  const dz = sim.z - g.z;
-  const near = dx * dx + dz * dz < 1.35 * 1.35;
-  const phaseOk = sim.w === g.w && sim.v === g.v;
-  if (phaseOk && dx * dx + dz * dz < 0.72 * 0.72) {
+  resolvePortal();
+  if (sim.mode === "play" && dist5(sim.pos, level.goal) < GOAL_R) {
     sim.mode = "win";
     sim.speed = 0;
     commitWin();
     return;
   }
-  if (near && !phaseOk) say("出口在另一层才显形");
-  else if (sim.note === "出口在另一层才显形") say("");
-
   publish();
 }
+
+const DIGITS = ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5"];
 
 export function bindKeys() {
   const onDown = (event: KeyboardEvent) => {
     held.add(event.code);
     if (sim.mode === "play") {
-      const block = [
-        "KeyW",
-        "KeyA",
-        "KeyS",
-        "KeyD",
-        "ArrowUp",
-        "ArrowDown",
-        "ArrowLeft",
-        "ArrowRight",
-        "Space",
-      ];
+      const block = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"];
       if (block.includes(event.code)) event.preventDefault();
     }
     if (event.repeat) return;
@@ -354,10 +387,11 @@ export function bindKeys() {
       return;
     }
     if (sim.mode !== "play") return;
-    if (event.code === "KeyQ") requestShift("w", -1);
-    if (event.code === "KeyE") requestShift("w", 1);
-    if (event.code === "KeyZ") requestShift("v", -1);
-    if (event.code === "KeyC") requestShift("v", 1);
+    const digit = DIGITS.indexOf(event.code);
+    if (digit >= 0) {
+      if (event.shiftKey) toggleOwned(digit);
+      else toggleDisplay(digit);
+    }
   };
   const onUp = (event: KeyboardEvent) => {
     held.delete(event.code);
@@ -366,6 +400,7 @@ export function bindKeys() {
     held.clear();
     sim.touchThrottle = 0;
     sim.touchSteer = 0;
+    sim.touchExtra = [0, 0, 0];
   };
   window.addEventListener("keydown", onDown);
   window.addEventListener("keyup", onUp);
@@ -381,7 +416,7 @@ export function bindKeys() {
       steerOverride = v;
     },
     setKeys: (codes) => {
-      keyOverride = new Set(codes);
+      setTestKeys(codes);
     },
   };
   return () => {
@@ -397,49 +432,6 @@ function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
-export function blockedCell(level: Level, x: number, z: number, w: number, v: number) {
-  if (x < level.bounds.minX || x > level.bounds.maxX) return true;
-  if (z < level.bounds.minZ || z > level.bounds.maxZ) return true;
-  if (w < 0 || v < 0 || w >= level.wCount || v >= level.vCount) return true;
-  return level.sets[phaseIndex(level, w, v)].has((x + 32) * 128 + (z + 32));
-}
-
-export function solve(level: Level) {
-  const startBlocked = blockedCell(level, level.start.x, level.start.z, level.start.w, level.start.v);
-  const goalBlocked = blockedCell(level, level.goal.x, level.goal.z, level.goal.w, level.goal.v);
-  const key = (x: number, z: number, w: number, v: number) =>
-    ((w * level.vCount + v) << 16) ^ ((x + 32) << 8) ^ (z + 32);
-  const q: number[][] = [[level.start.x, level.start.z, level.start.w, level.start.v, 0]];
-  const seen = new Set<number>([key(level.start.x, level.start.z, level.start.w, level.start.v)]);
-  let qi = 0;
-  let length = -1;
-  while (qi < q.length) {
-    const [x, z, w, v, d] = q[qi++];
-    if (x === level.goal.x && z === level.goal.z && w === level.goal.w && v === level.goal.v) {
-      length = d;
-      break;
-    }
-    const moves: Array<[number, number, number, number]> = [
-      [x + 1, z, w, v],
-      [x - 1, z, w, v],
-      [x, z + 1, w, v],
-      [x, z - 1, w, v],
-      [x, z, w + 1, v],
-      [x, z, w - 1, v],
-      [x, z, w, v + 1],
-      [x, z, w, v - 1],
-    ];
-    for (const [nx, nz, nw, nv] of moves) {
-      if (blockedCell(level, nx, nz, nw, nv)) continue;
-      const k = key(nx, nz, nw, nv);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      q.push([nx, nz, nw, nv, d + 1]);
-    }
-  }
-  return { length, startBlocked, goalBlocked, visited: seen.size };
-}
-
 declare global {
   interface Window {
     __controlsTest?: {
@@ -452,3 +444,4 @@ declare global {
 }
 
 loadLevel(0);
+export type { Vec5 };

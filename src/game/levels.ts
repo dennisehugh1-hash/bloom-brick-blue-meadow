@@ -1,6 +1,4 @@
-export type Wall = { x: number; z: number; stable: boolean };
-
-export type Bounds = { minX: number; maxX: number; minZ: number; maxZ: number };
+import type { Box, Portal, Solid, Vec5 } from "./space.ts";
 
 export type Level = {
   id: string;
@@ -8,245 +6,230 @@ export type Level = {
   kicker: string;
   brief: string;
   hud: string;
-  wCount: number;
-  vCount: number;
-  start: { x: number; z: number; w: number; v: number; yaw: number };
-  goal: { x: number; z: number; w: number; v: number };
-  bounds: Bounds;
-  lists: Wall[][];
-  ghostsW: Wall[][];
-  ghostsV: Wall[][];
-  sets: Set<number>[];
+  bounds: Box;
+  solids: Solid[];
+  ghosts: Solid[];
+  portals: Portal[];
+  start: { pos: Vec5; owned: boolean[]; order: number[]; yaw: number };
+  goal: Vec5;
 };
-
-const CELL = (x: number, z: number) => (x + 32) * 128 + (z + 32);
-
-function build(
-  spec: Omit<Level, "lists" | "ghostsW" | "ghostsV" | "sets"> & {
-    paint: (add: (x: number, z: number, w: number, v: number) => void) => void;
-  },
-): Level {
-  const { wCount, vCount } = spec;
-  const n = wCount * vCount;
-  const sets = Array.from({ length: n }, () => new Set<number>());
-  const lists: Wall[][] = Array.from({ length: n }, () => []);
-  const at = (w: number, v: number) => w * vCount + v;
-
-  const add = (x: number, z: number, w: number, v: number) => {
-    if (w < 0 || v < 0 || w >= wCount || v >= vCount) return;
-    if (x < spec.bounds.minX || x > spec.bounds.maxX) return;
-    if (z < spec.bounds.minZ || z > spec.bounds.maxZ) return;
-    const h = CELL(x, z);
-    const s = sets[at(w, v)];
-    if (s.has(h)) return;
-    s.add(h);
-    lists[at(w, v)].push({ x, z, stable: false });
-  };
-
-  spec.paint(add);
-
-  for (let w = 0; w < wCount; w++) {
-    for (let v = 0; v < vCount; v++) {
-      for (const wall of lists[at(w, v)]) {
-        const h = CELL(wall.x, wall.z);
-        let adj = 0;
-        let has = 0;
-        const look = (ww: number, vv: number) => {
-          if (ww < 0 || vv < 0 || ww >= wCount || vv >= vCount) return;
-          adj += 1;
-          if (sets[at(ww, vv)].has(h)) has += 1;
-        };
-        look(w - 1, v);
-        look(w + 1, v);
-        look(w, v - 1);
-        look(w, v + 1);
-        wall.stable = adj > 0 && has === adj;
-      }
-    }
-  }
-
-  const ghosts = (axis: "w" | "v") => {
-    const out: Wall[][] = Array.from({ length: n }, () => []);
-    for (let w = 0; w < wCount; w++) {
-      for (let v = 0; v < vCount; v++) {
-        const dest = out[at(w, v)];
-        const seen = new Set<number>();
-        const neighbors: Array<[number, number]> =
-          axis === "w"
-            ? [
-                [w - 1, v],
-                [w + 1, v],
-              ]
-            : [
-                [w, v - 1],
-                [w, v + 1],
-              ];
-        for (const [ww, vv] of neighbors) {
-          if (ww < 0 || vv < 0 || ww >= wCount || vv >= vCount) continue;
-          for (const wall of lists[at(ww, vv)]) {
-            const h = CELL(wall.x, wall.z);
-            if (sets[at(w, v)].has(h) || seen.has(h)) continue;
-            seen.add(h);
-            dest.push(wall);
-          }
-        }
-      }
-    }
-    return out;
-  };
-
-  return {
-    id: spec.id,
-    name: spec.name,
-    kicker: spec.kicker,
-    brief: spec.brief,
-    hud: spec.hud,
-    wCount,
-    vCount,
-    start: spec.start,
-    goal: spec.goal,
-    bounds: spec.bounds,
-    lists,
-    sets,
-    ghostsW: ghosts("w"),
-    ghostsV: ghosts("v"),
-  };
-}
 
 const FACE = Math.PI;
 
+function v5(x: number, y: number, z: number, w: number, v: number): Vec5 {
+  return [x, y, z, w, v];
+}
+
+function bounds(n: number): Box {
+  return { min: v5(-n, -n, -n, -n, -n), max: v5(n, n, n, n, n) };
+}
+
+function full(box: Box, axis: number, a: number, b: number): Solid {
+  const min = box.min.slice() as Vec5;
+  const max = box.max.slice() as Vec5;
+  min[axis] = a;
+  max[axis] = b;
+  return { min, max, tone: "wall" };
+}
+
+/** Two boxes that leave |gapAxis| < gapHalf empty, and fill every other axis. */
+function slit(box: Box, blockAxis: number, a: number, b: number, gapAxis: number, gapHalf: number): Solid[] {
+  const lo = full(box, blockAxis, a, b);
+  const hi = full(box, blockAxis, a, b);
+  lo.max[gapAxis] = -gapHalf;
+  hi.min[gapAxis] = gapHalf;
+  return [lo, hi];
+}
+
+function own(...axes: number[]): boolean[] {
+  const mask = [false, false, false, false, false];
+  for (const axis of axes) mask[axis] = true;
+  return mask;
+}
+
+function portal(id: string, axes: number[], dest: number[], min: Vec5, max: Vec5): Portal {
+  return { id, axes, dest, min, max };
+}
+
+function mouth(loose: Array<[number, number, number]>, tight = 0.45): { min: Vec5; max: Vec5 } {
+  const min = v5(-tight, -tight, -tight, -tight, -tight);
+  const max = v5(tight, tight, tight, tight, tight);
+  for (const [axis, a, b] of loose) {
+    min[axis] = a;
+    max[axis] = b;
+  }
+  return { min, max };
+}
+
 export const levels: Level[] = [
-  build({
-    id: "first-axis",
-    name: "初轴",
-    kicker: "W AXIS",
-    brief: "正前方那堵墙只存在于 W = 0。拨到另一层，它就从截面里消失。出口要在 W = 1 才亮。",
-    hud: "墙只在 W=0。出口在 W=1。",
-    wCount: 2,
-    vCount: 1,
-    bounds: { minX: -5, maxX: 5, minZ: -6, maxZ: 6 },
-    start: { x: 0, z: -5, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 1, v: 0 },
-    paint: (add) => {
-      for (let x = -5; x <= 5; x++) add(x, 0, 0, 0);
-    },
-  }),
-  build({
-    id: "offset-seam",
-    name: "错缝",
-    kicker: "V SEAM",
-    brief: "同一道闸在两条折叠层上错开一格。拨 V，中间那条缝才会出现。出口在 V = 1。",
-    hud: "缝只在 V=1。出口也在这一层。",
-    wCount: 1,
-    vCount: 2,
-    bounds: { minX: -5, maxX: 5, minZ: -6, maxZ: 6 },
-    start: { x: 0, z: -5, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 0, v: 1 },
-    paint: (add) => {
-      for (let x = -5; x <= 5; x++) add(x, 0, 0, 0);
-      for (let x = -5; x <= 5; x++) if (x !== 0) add(x, 0, 0, 1);
-      add(-3, -3, 0, 0);
-      add(3, -3, 0, 0);
-      add(-3, -3, 0, 1);
-      add(3, -3, 0, 1);
-    },
-  }),
-  build({
-    id: "interlock",
-    name: "联锁",
-    kicker: "TWO AXES",
-    brief: "南门跟着显形轴 W，北门跟着折叠轴 V。两道都打开、并且停在那一层，出口光圈才算真正显形。",
-    hud: "南门看 W，北门看 V。出口要 W=1 且 V=1。",
-    wCount: 2,
-    vCount: 2,
-    bounds: { minX: -5, maxX: 5, minZ: -6, maxZ: 6 },
-    start: { x: 0, z: -5, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 1, v: 1 },
-    paint: (add) => {
-      for (let v = 0; v < 2; v++) {
-        for (let x = -5; x <= 5; x++) add(x, -1, 0, v);
-      }
-      for (let w = 0; w < 2; w++) {
-        for (let x = -5; x <= 5; x++) add(x, 2, w, 0);
-      }
-    },
-  }),
-  build({
-    id: "gallery",
-    name: "侧廊",
-    kicker: "GHOSTS",
-    brief: "正中是每一层都在的实墙。西廊只在 W = 2 挖通；W = 1 只有一个死凹。线框是邻层的预告，不是现在能撞上的东西。",
-    hud: "西廊在 W=2。铜线框是邻层。",
-    wCount: 3,
-    vCount: 1,
-    bounds: { minX: -6, maxX: 6, minZ: -6, maxZ: 6 },
-    start: { x: 0, z: -5, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 2, v: 0 },
-    paint: (add) => {
-      for (let w = 0; w < 3; w++) {
-        for (let x = -1; x <= 6; x++) add(x, 0, w, 0);
-      }
-      for (let x = -6; x <= -2; x++) add(x, 0, 0, 0);
-      for (let x = -5; x <= -2; x++) add(x, 0, 1, 0);
-      add(-6, 1, 1, 0);
-      add(4, -3, 0, 0);
-      add(4, -3, 1, 0);
-      add(4, -3, 2, 0);
-    },
-  }),
-  build({
-    id: "coupled",
-    name: "耦合",
-    kicker: "GEARED",
-    brief: "两道闸咬合：你刚穿过的南缝，换层之后会关上。先从西缝过去，再把 W 和 V 都拨到 1，北闸中间才打开。",
-    hud: "南缝会在换层后关闭。出口要 W=1 且 V=1。",
-    wCount: 2,
-    vCount: 2,
-    bounds: { minX: -5, maxX: 5, minZ: -6, maxZ: 6 },
-    start: { x: 0, z: -5, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 1, v: 1 },
-    paint: (add) => {
-      for (let w = 0; w < 2; w++) {
-        for (let v = 0; v < 2; v++) {
-          for (let x = -5; x <= 5; x++) {
-            const southGap = w === 0 ? -2 : 1;
-            if (x !== southGap) add(x, 0, w, v);
-            const northOpen = w === 1 && v === 1 && x === 0;
-            if (!northOpen) add(x, 3, w, v);
-          }
-        }
-      }
-    },
-  }),
-  build({
-    id: "core",
-    name: "芯室",
+  {
+    id: "shadow",
+    name: "投影",
+    kicker: "SHADOW",
+    brief: "显影不是切片。只展开 X 时，墙和另一处的纸色影子叠在同一条线上。把 Y 纳进探针再显影，才能从墙的上方绕过去。影子在 W 上，你碰不到。",
+    hud: "显影 Y 并纳入它，再从墙的上方绕到出口。",
+    bounds: bounds(5),
+    solids: [
+      {
+        min: v5(1.5, -5, -5, -5, -5),
+        max: v5(2.4, 0.5, 5, 5, 5),
+        tone: "wall",
+      },
+    ],
+    ghosts: [
+      {
+        min: v5(1.55, -5, -5, 2, -5),
+        max: v5(2.35, 0.5, 5, 3.2, 5),
+        tone: "ghost",
+      },
+    ],
+    portals: [],
+    start: { pos: v5(-2.2, 0, 0, 0, 0), owned: own(0), order: [0], yaw: FACE },
+    goal: v5(4, 1.2, 0, 0, 0),
+  },
+  {
+    id: "needle",
+    name: "细针",
+    kicker: "RANK",
+    brief: "缝比探针的厚度窄。Y 还纳入着的时候过不去。把 Y 释放，探针在这根轴上变成细针，才能从缝里穿过去。",
+    hud: "释放 Y，再沿 X 穿过细缝。",
+    bounds: bounds(5),
+    solids: slit(bounds(5), 0, 1.6, 2.5, 1, 0.16),
+    ghosts: [],
+    portals: [],
+    start: { pos: v5(-2, 0, 0, 0, 0), owned: own(0, 1), order: [0, 1], yaw: -Math.PI / 2 },
+    goal: v5(4, 0, 0, 0, 0),
+  },
+  {
+    id: "point",
+    name: "点门",
+    kicker: "1-GATE",
+    brief: "一维传送点只改一个坐标。整面墙封死了 X，点门把 X 咬到墙的另一侧。别的轴原样穿过。",
+    hud: "把探针开进点门。它只改 X。",
+    bounds: bounds(6),
+    solids: [full(bounds(6), 0, 0.4, 1.2)],
+    ghosts: [],
+    portals: [
+      portal("x-point", [0], [3.5], mouth([[0, -4.2, -1.4]]).min, mouth([[0, -4.2, -1.4]]).max),
+    ],
+    start: { pos: v5(-5, 0, 0, 0, 0), owned: own(0), order: [0], yaw: FACE },
+    goal: v5(4.4, 0, 0, 0, 0),
+  },
+  {
+    id: "plane",
+    name: "面门",
+    kicker: "2-GATE",
+    brief: "二维门要同时咬住 X 和 W。只纳入 X 时，残缺落点埋在实体里，门会拒绝。把 W 显影并纳入，整扇门才放行。",
+    hud: "纳入 W 后再进面门。只带 X 会被拒。",
+    bounds: bounds(6),
+    solids: [full(bounds(6), 0, 3.3, 4.7)],
+    ghosts: [],
+    portals: [
+      portal("xw", [0, 3], [4, 3], mouth([[0, -0.9, 0.9]]).min, mouth([[0, -0.9, 0.9]]).max),
+    ],
+    start: { pos: v5(0, 0, 0, 0, 0), owned: own(0), order: [0], yaw: FACE },
+    goal: v5(4, 0, 0, 3, 0),
+  },
+  {
+    id: "volume",
+    name: "体门",
+    kicker: "3-GATE",
+    brief: "三维体同时改 X、Y、Z。去门口要先穿过一条比厚度更窄的 V 缝，所以得先释放 V。体门不咬你没纳入的 Z：缺了 Z，落点是实的。",
+    hud: "释放 V 过缝，纳入 Z，再进三维体。",
+    bounds: bounds(6),
+    solids: [
+      ...slit(bounds(6), 0, -2.2, -1.4, 4, 0.16),
+      full(bounds(6), 0, 0.8, 1.4),
+      {
+        min: v5(3, 1.4, -0.45, -6, -6),
+        max: v5(4.2, 2.6, 0.55, 6, 6),
+        tone: "wall",
+      },
+    ],
+    ghosts: [],
+    portals: [portal("xyz", [0, 1, 2], [3.5, 2, -2], mouth([[0, -0.55, 0.55]]).min, mouth([[0, -0.55, 0.55]]).max)],
+    start: { pos: v5(-4, 0, 0, 0, 0), owned: own(0, 1, 4), order: [0, 1], yaw: -Math.PI / 2 },
+    goal: v5(3.5, 2, -2, 0, 0),
+  },
+  {
+    id: "all-five",
+    name: "齐轴",
     kicker: "FIVE",
-    brief: "三道闸各认一组坐标：先 W1 V0，再 W1 V1，最后 W2 V2。门洞在别的层是实心的——别站在门里换层。",
-    hud: "三闸：W1V0 → W1V1 → W2V2。别在门洞里换层。",
-    wCount: 3,
-    vCount: 3,
-    bounds: { minX: -6, maxX: 6, minZ: -7, maxZ: 7 },
-    start: { x: 0, z: -6, w: 0, v: 0, yaw: FACE },
-    goal: { x: 0, z: 5, w: 2, v: 2 },
-    paint: (add) => {
-      for (let w = 0; w < 3; w++) {
-        for (let v = 0; v < 3; v++) {
-          for (let x = -6; x <= 6; x++) {
-            if (!(w === 1 && v === 0 && x === 0)) add(x, -4, w, v);
-            if (!(w === 1 && v === 1 && x === 2)) add(x, -1, w, v);
-            if (!(w === 2 && v === 2 && x === 0)) add(x, 2, w, v);
-          }
-          add(-5, -6, w, v);
-          add(5, -6, w, v);
-          add(-5, 6, w, v);
-          add(5, 6, w, v);
-        }
-      }
-    },
-  }),
+    brief: "细缝认 Y 的阶，点门认 Z，面门认 X 和 Y，体门认 X、W、V。少一根被咬住的轴，落点就是实体。五根轴都要轮到。",
+    hud: "过 Y 缝，纳入 Y 进面门；纳入 Z 进点门；纳入 W 和 V 进体门。",
+    bounds: bounds(6),
+    solids: [
+      ...slit(bounds(6), 0, -5.15, -4.75, 1, 0.16),
+      full(bounds(6), 0, -1.3, -0.7),
+      full(bounds(6), 2, 0.75, 1.35),
+      full(bounds(6), 3, 0.65, 1.25),
+      full(bounds(6), 4, -1.25, -0.65),
+      {
+        min: v5(1.55, -0.7, -6, -6, -6),
+        max: v5(2.55, 0.7, 6, 6, 6),
+        tone: "wall",
+      },
+      {
+        min: v5(2.7, -6, -6, -0.55, -0.55),
+        max: v5(3.4, 6, 6, 0.55, 0.55),
+        tone: "wall",
+      },
+      {
+        min: v5(2.7, -6, -6, -0.55, -3.4),
+        max: v5(3.4, 6, 6, 0.55, -2.6),
+        tone: "wall",
+      },
+      {
+        min: v5(2.7, -6, -6, 2.6, -0.55),
+        max: v5(3.4, 6, 6, 3.4, 0.55),
+        tone: "wall",
+      },
+    ],
+    ghosts: [],
+    portals: [
+      portal(
+        "plane-xy",
+        [0, 1],
+        [2, 2],
+        mouth([[0, -4.35, -3.55]]).min,
+        mouth([[0, -4.35, -3.55]]).max,
+      ),
+      portal(
+        "point-z",
+        [2],
+        [2],
+        mouth([
+          [0, 1.55, 2.55],
+          [1, 1.55, 2.55],
+          [2, -0.45, 0.45],
+        ]).min,
+        mouth([
+          [0, 1.55, 2.55],
+          [1, 1.55, 2.55],
+          [2, -0.45, 0.45],
+        ]).max,
+      ),
+      portal(
+        "volume-xwv",
+        [0, 3, 4],
+        [3, 3, -3],
+        mouth([
+          [0, 1.55, 2.55],
+          [1, 1.55, 2.55],
+          [2, 1.55, 2.55],
+        ]).min,
+        mouth([
+          [0, 1.55, 2.55],
+          [1, 1.55, 2.55],
+          [2, 1.55, 2.55],
+        ]).max,
+      ),
+    ],
+    start: { pos: v5(-5.5, 0, 0, 0, 0), owned: own(0), order: [0], yaw: FACE },
+    goal: v5(3, 2, 2, 3, -3),
+  },
 ];
 
-export function phaseIndex(level: Level, w: number, v: number) {
-  return w * level.vCount + v;
-}
+const level4 = levels[3];
+level4.solids[0].max[3] = 1;
+level4.solids[0].min[3] = -1;
