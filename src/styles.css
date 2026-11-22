@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #121614;
+  --color-surface: #1c2420;
+  --color-fg: #e7e2d6;
+  --color-muted: #9aa396;
+  --color-brass: #c6a36a;
+  --color-signal: #e25b3a;
+  --color-line: #2e3a34;
+  --font-display: "Liberation Serif", "Noto Serif SC", "Songti SC", serif;
+  --font-sans: "WenQuanYi Zen Hei", "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
+.game-root {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.vignette {
+  background: radial-gradient(ellipse at center, transparent 45%, var(--color-bg) 100%);
+}
+
+.shutter {
+  background: radial-gradient(circle at center, transparent 20%, var(--color-brass) 140%);
+  mix-blend-mode: screen;
+}
+
+.safe-b {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}

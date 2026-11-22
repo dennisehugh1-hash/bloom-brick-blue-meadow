@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "APPEARANCE",
+      "hasCanvas": false,
+      "bodyTextLen": 187,
+      "bodyTextHash": "c110beb7d2026c0ec1155ac8295c49e38726c1aaa9236391042a62f27f4ec722",
+      "bodyTextPrefix": "APPEARANCE 五维显形 相位探针在五维腔体的三维截面里行驶。墙不是被搬走了，只是这一层看不见。把探针开到出口光圈亮起的坐",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "APPEARANCE",
+      "hasCanvas": false,
+      "bodyTextLen": 187,
+      "bodyTextHash": "c110beb7d2026c0ec1155ac8295c49e38726c1aaa9236391042a62f27f4ec722",
+      "bodyTextPrefix": "APPEARANCE 五维显形 相位探针在五维腔体的三维截面里行驶。墙不是被搬走了，只是这一层看不见。把探针开到出口光圈亮起的坐",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}
